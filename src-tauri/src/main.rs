@@ -110,7 +110,7 @@ async fn listen_for_ipc(app_handle: tauri::AppHandle) {
 }
 
 async fn run_7z(app_handle: &tauri::AppHandle, input: String, output: String, filter: String) {
-  let mut cmd = Command::new("7z")
+  let mut cmd = Command::new("7z.exe")
   .raw_arg("x")
   .raw_arg(&input)
   .raw_arg(format!("-o{}", output))
