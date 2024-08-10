@@ -13,5 +13,8 @@
     "@tauri-apps/cli": "^1.6.0",
     "typescript": "^5.2.2",
     "vite": "^5.3.4"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^1.6.0"
   }
 }
