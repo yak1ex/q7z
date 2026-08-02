@@ -12,8 +12,10 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
 `
 
 const { setProgress } = setupProgress(document.querySelector<HTMLDivElement>('#progress')!)
-await listen('percent', (event) => {
-  if(typeof(event.payload) === 'string') {
-    setProgress(parseInt(event.payload))
-  }
-})
+void (async () => {
+  await listen('percent', (event) => {
+    if(typeof(event.payload) === 'string') {
+      setProgress(parseInt(event.payload))
+    }
+  })
+})()

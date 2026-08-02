@@ -13,13 +13,12 @@ Develop a dependable Windows desktop application that accepts 7-Zip extraction r
 
 ## Current status
 
-The repository is an early prototype. A Tauri backend can become a named-local-socket listener, receive later invocations as NUL-delimited extraction requests, execute them serially through `7z.exe`, parse percentage output, and emit progress to a minimal TypeScript UI. The first invocation does not execute its own request, job state and logs are not exposed, runtime errors commonly panic, and process completion is not checked. On 2026-08-02, `npm run build` failed because top-level `await` is incompatible with the configured Safari 13 target. `cargo check --locked` did not finish within a three-minute check window, so current Rust compilation is unverified.
+The repository is an early prototype. A Tauri backend can become a named-local-socket listener, receive later invocations as NUL-delimited extraction requests, execute them serially through `7z.exe`, parse percentage output, and emit progress to a minimal TypeScript UI. The first invocation does not execute its own request, job state and logs are not exposed, runtime errors commonly panic, and process completion is not checked. As of 2026-08-02, the build baseline is restored: `npm run build`, `cargo fmt --check`, `cargo check --locked`, and `cargo test --locked` (0 tests configured) all pass on Windows.
 
 ## Active task
 
-- Task: `T002`
-- Current step: Stabilize the build and establish a repeatable verification baseline before extending queue behavior.
-- Next verification: Make `npm run build` pass, then run `cargo fmt --check`, `cargo check --locked`, and `cargo test --locked` from `src-tauri/`.
+- Task: `T001` (prototype close-out) — next: make the first process enqueue its own request, replace panic paths with recoverable diagnostics, and validate arguments/paths/filters/IPC/progress before Windows end-to-end verification.
+- Recently completed: `T002` restored the reproducible build and check baseline.
 
 ## Tasks
 
@@ -55,7 +54,7 @@ Use stable IDs. Append newly accepted work using the next unused ID. Never reuse
 
 ### T002 — Restore a reproducible build and check baseline
 
-- Status: in progress
+- Status: completed
 - Objective: Make the current frontend and Rust application pass the repository's applicable static and build checks without changing intended behavior.
 - Scope:
   - Remove the frontend's incompatible top-level-await usage or deliberately align the supported build target.
@@ -66,14 +65,18 @@ Use stable IDs. Append newly accepted work using the next unused ID. Never reuse
   - `cargo fmt --check`, `cargo check --locked`, and `cargo test --locked` complete successfully.
   - No unrelated dependency or generated-file changes are introduced.
 - Implemented:
-  - Diagnosed the current frontend build failure.
-- Verification:
-  - `npm run build` failed on 2026-08-02: Vite/esbuild rejected top-level `await` for the configured Safari 13 target.
-  - `cargo check --locked` timed out after approximately three minutes on 2026-08-02; no pass or source failure was established.
+  - Wrapped the top-level `await listen('percent', ...)` in `src/main.ts` in an `async` IIFE so ES2020/Safari 13 builds without top-level-await support; behavior preserved.
+  - Applied `cargo fmt` to `src-tauri/build.rs` and `src-tauri/src/main.rs` to satisfy `cargo fmt --check`; no semantic changes.
+- Verification (2026-08-02, Windows):
+  - `npx tsc --noEmit`: passed (no output).
+  - `npm run build`: passed (`tsc && vite build`, 9 modules transformed, 629 ms).
+  - `cargo fmt --check` (from `src-tauri/`): exit 0.
+  - `cargo check --locked` (from `src-tauri/`): `Finished dev profile` in 9.96 s.
+  - `cargo test --locked` (from `src-tauri/`): `Finished test profile` in 2m 21s; `running 0 tests` — no automated tests are configured yet (see `T006`).
 - Remaining:
-  - Implement the frontend compatibility fix and run all acceptance checks.
+  - None for `T002`. The historical `package-lock.json` modification noted in the prior task record is no longer present in the working tree; nothing to preserve or reconcile.
 - Notes:
-  - The pre-existing `package-lock.json` modification must be preserved or explicitly reconciled before completion.
+  - The build baseline is now reproducible. Subsequent tasks can use the four acceptance commands as the focused regression set before finalizing broader work.
 
 ### T003 — Define reliable job and IPC semantics
 
