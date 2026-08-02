@@ -13,12 +13,12 @@ Develop a dependable Windows desktop application that accepts 7-Zip extraction r
 
 ## Current status
 
-The repository is an early prototype. A Tauri backend can become a named-local-socket listener, receive later invocations as NUL-delimited extraction requests, execute them serially through `7z.exe`, parse percentage output, and emit progress to a minimal TypeScript UI. The first invocation does not execute its own request, job state and logs are not exposed, runtime errors commonly panic, and process completion is not checked. As of 2026-08-02, the build baseline is restored: `npm run build`, `cargo fmt --check`, `cargo check --locked`, and `cargo test --locked` (0 tests configured) all pass on Windows.
+The repository is an early prototype. A Tauri backend hosts a single serial extraction worker fed by an mpsc channel; a named-local-socket listener enqueues forwarded jobs, and the first invocation enqueues its own request through the same channel. `7z.exe` runs serially, percentage output is parsed and emitted to a minimal TypeScript UI, and a `job` event plus a `current_job` command identify the active request. Panic paths in the listener and process runner were replaced with recoverable diagnostics, and process completion is awaited. The optional `filter` CLI arg is forwarded only when actually supplied (Tauri represents an unprovided optional arg as `Value::Bool(false)` with `occurrences == 0`; the prior code emitted the literal string `"false"` as a 7z filter, matching no files). On completion, "Everything is Ok" forces the `percent` event to `100` so the progress bar fills. Job state/log streaming, full validation, exit-status-based success/failure (currently inferred from `Everything is Ok`, not the exit code), capturing 7z's stderr, structured IPC framing/acknowledgements, automated tests, and Windows packaging remain pending. As of 2026-08-02, `npm run build`, `cargo fmt --check`, `cargo check --locked`, and `cargo test --locked` (0 tests configured) all pass on Windows.
 
 ## Active task
 
-- Task: `T001` (prototype close-out) — next: make the first process enqueue its own request, replace panic paths with recoverable diagnostics, and validate arguments/paths/filters/IPC/progress before Windows end-to-end verification.
-- Recently completed: `T002` restored the reproducible build and check baseline.
+- Task: `T003` (reliable job and IPC semantics) — next: design structured job identity/states, version or replace the NUL-delimited IPC format with framing and acknowledgements, handle malformed messages and the remaining listener-start race (first invocation starts before any worker exists; forwarded jobs rely on a connection succeeding), and add automated tests for parsing and queue ordering.
+- Recently completed: `T002` restored the build baseline; `T001` prototype is complete — implemented and verified end-to-end on Windows including queueing, serial execution, first-invocation enqueue, worker survival after a failing archive, percentage emission, forcing 100% on completion, and visual UI confirmation (current request displayed in both first-invocation and forwarded cases).
 
 ## Tasks
 
@@ -26,7 +26,7 @@ Use stable IDs. Append newly accepted work using the next unused ID. Never reuse
 
 ### T001 — Establish the extraction-queue prototype
 
-- Status: in progress
+- Status: completed
 - Objective: Demonstrate that multiple q7z invocations can feed extraction work to one visible worker and report progress.
 - Scope:
   - Define positional input, output, and optional filter arguments.
@@ -42,15 +42,27 @@ Use stable IDs. Append newly accepted work using the next unused ID. Never reuse
   - Added a hidden-on-start Tauri window, positional CLI configuration, named local-socket listener, and second-process forwarding.
   - Added sequential `7z.exe x` execution for forwarded requests with output directory, auto-rename, progress, and filter arguments.
   - Added OEM-code-page decoding, percentage parsing, a Tauri `percent` event, and a basic progress bar.
+  - Added a single serial worker fed by a `tokio::sync::mpsc` channel; the listener enqueues forwarded jobs and the first invocation enqueues its own parsed request through the same channel, so first and later invocations follow one path and execute in arrival order.
+  - Replaced panic paths in `listen_for_ipc` (accept, read, parse) and `run_7z` (spawn, read, emit) with `eprintln!` diagnostics and `continue`/early-return; a failed job no longer terminates the worker or listener.
+  - Await `7z.exe` completion via `cmd.wait().await` (previously completion was not checked).
+  - Added a `job` event carrying `(input, output)` and a frontend listener that writes it to `#input` so the UI identifies the current request.
 - Verification:
   - Static source review completed on 2026-08-02.
-  - No successful end-to-end Windows extraction evidence is recorded.
+  - 2026-08-02 (Windows): `npx tsc --noEmit`, `npm run build`, `cargo fmt --check`, `cargo check --locked` (no warnings), `cargo test --locked` (0 tests configured) all pass after the change.
+  - 2026-08-02 (Windows, end-to-end via `npm run tauri build -- --debug` then `src-tauri\target\debug\q7z.exe`; `7z.exe` is 7-Zip 26.02 x64 on `PATH`, resolved at `C:\Users\atarashi\scoop\shims\7z.exe`):
+    - **First-invocation enqueue + serial execution**: launching the worker with `archive.7z -> out1`, then a second process forwarding `archive.7z -> out2`, produced exactly one `Everything is Ok / Files: 2` per job and populated both `out1` and `out2` with `hello.txt` and `file two.txt`. Jobs ran serially in arrival order (the second `Extracting` block appears after the first `Everything is Ok`).
+    - **Worker survives a failing job**: a corrupted `bad.7z` (hand-crafted invalid header) produced a clear diagnostic on the worker's stderr — `ERROR: ... Cannot open the file as [7z] archive / ERRORS: Is not archive` — and a subsequent valid invocation (`archive.7z -> out3b`) was still accepted and completed `Files: 2`. `run_7z` did not panic and the listener kept accepting.
+    - **Percentage events**: a 200-file (~40 MiB) archive produced 7z percentage lines (`  0%`, ` 76% 73 - file165.bin`, ` 99% 161 - file64.bin`) captured by the worker's reader, so the `re.captures` → `emit_all("percent", ...)` path executed. All 200 files extracted.
+  - 2026-08-02 (Windows, UI manual confirmation by user, `npm run tauri build -- --debug` binary):
+    - **Case 1 (no prior process)**: window opens, `#input` shows `archive -> outdir`, progress bar advances and reaches full. (Initially failed — first-invocation `job` event fired before the webview's listener attached — fixed by adding a `current_job` Tauri command backed by `AppState.current_job: Mutex<Option<(String,String)>>` set at each job's start; the frontend invokes it after its listeners register and populates `#input` from the response.)
+    - **Case 2 (forwarded to a running worker)**: `#input` updates to the new path and the bar resets and fills. Behavior preserved across the fix.
+- Verification:
+  - All four acceptance commands pass after the final edits: `npx tsc --noEmit`, `npm run build`, `cargo fmt --check`, `cargo check --locked` (no warnings), `cargo test --locked` (0 tests configured).
 - Remaining:
-  - Execute the first process's request instead of only printing its parsed arguments.
-  - Validate arguments, paths, filters, IPC messages, progress payloads, and paths containing spaces or non-ASCII text.
-  - Replace panic paths with recoverable diagnostics and verify ordered execution on Windows.
+  - Force 100% on `"Everything is Ok"` — **done** (the `percent: 100` emit on `Everything is Ok` is in place; fuller completion semantics belong to `T004`/`T005`).
+  - Comprehensive argument/path/filter/IPC/progress validation — `T003` (job/IPC semantics) and `T004` (robust 7-Zip execution), including exit-status-based success/failure (currently inferred from `Everything is Ok`, not the exit code), capturing 7z's stderr, and spaces/non-ASCII argument safety.
 - Notes:
-  - Later task IDs separate baseline, lifecycle, UI, and test work, but this prototype remains `in progress` until its demonstration criteria are met.
+  - T001 demonstration criteria are met. The listener-start race narrowed here (forwarded-vs-first-invocation path divergence) remains material to `T003`'s structured-IPC scope.
 
 ### T002 — Restore a reproducible build and check baseline
 
