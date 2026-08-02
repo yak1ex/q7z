@@ -1,19 +1,21 @@
-// Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use anyhow::anyhow;
+use interprocess::local_socket::tokio::{Listener, Stream as TokioStream};
 use interprocess::local_socket::{
     prelude::*, tokio::prelude::*, GenericNamespaced, ListenerOptions, Name, Stream,
 };
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 #[cfg(not(debug_assertions))]
 use tauri::api::dialog::blocking::message;
 use tauri::{Manager, State};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -21,22 +23,58 @@ use codepage::to_encoding;
 use encoding_rs::Encoding;
 use windows::Win32::Globalization::GetOEMCP;
 
-fn get_socket_name() -> Name<'static> {
-    let id = "dev.yakex.q7z_ipc";
-    let name = id.to_ns_name::<GenericNamespaced>().unwrap();
-    name
+#[derive(Serialize, Deserialize)]
+struct JobRequest {
+    input: String,
+    output: String,
+    #[serde(default)]
+    filter: String,
 }
 
-fn matches_to_message(matches: tauri::api::cli::Matches) -> Option<String> {
+#[derive(Serialize, Deserialize)]
+struct JobResponse {
+    accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+struct Job {
+    #[allow(dead_code)]
+    id: u64,
+    input: String,
+    output: String,
+    filter: String,
+}
+
+#[derive(Default)]
+struct AppState {
+    current_job: Mutex<Option<(String, String)>>,
+    next_job_id: AtomicU64,
+}
+
+#[tauri::command]
+fn current_job(state: State<AppState>) -> Option<(String, String)> {
+    state.current_job.lock().unwrap().clone()
+}
+
+fn get_socket_name() -> Name<'static> {
+    let id = "dev.yakex.q7z_ipc";
+    id.to_ns_name::<GenericNamespaced>().unwrap()
+}
+
+fn create_listener() -> Result<Listener, std::io::Error> {
+    tauri::async_runtime::block_on(async {
+        ListenerOptions::new()
+            .name(get_socket_name())
+            .create_tokio()
+    })
+}
+
+fn matches_to_request(matches: &tauri::api::cli::Matches) -> Option<JobRequest> {
     let input = matches.args.get("input")?;
     let output = matches.args.get("output")?;
-    let filter_val = match matches.args.get("filter") {
-        Some(f) if f.occurrences > 0 => match &f.value {
-            serde_json::Value::String(s) => s.clone(),
-            _ => return None,
-        },
-        _ => String::new(),
-    };
     let input_val = match &input.value {
         serde_json::Value::String(s) => s.clone(),
         _ => return None,
@@ -45,33 +83,36 @@ fn matches_to_message(matches: tauri::api::cli::Matches) -> Option<String> {
         serde_json::Value::String(s) => s.clone(),
         _ => return None,
     };
-    Some(format!("{}\0{}\0{}\n", input_val, output_val, filter_val))
+    let filter_val = match matches.args.get("filter") {
+        Some(f) if f.occurrences > 0 => match &f.value {
+            serde_json::Value::String(s) => s.clone(),
+            _ => return None,
+        },
+        _ => String::new(),
+    };
+    Some(JobRequest {
+        input: input_val,
+        output: output_val,
+        filter: filter_val,
+    })
 }
 
-#[derive(Default)]
-struct AppState {
-    current_job: Mutex<Option<(String, String)>>,
+fn parse_request(line: &str) -> Option<JobRequest> {
+    serde_json::from_str(line).ok()
 }
 
-#[tauri::command]
-fn current_job(state: State<AppState>) -> Option<(String, String)> {
-    state.current_job.lock().unwrap().clone()
+fn parse_response(line: &str) -> Option<JobResponse> {
+    serde_json::from_str(line).ok()
 }
 
-/// Parse a NUL-delimited `input\0output\0filter\n` message into a job tuple.
-/// Returns None if the message is malformed (missing trailing newline or not
-/// exactly three fields), so callers can reject it without panicking.
-fn parse_message(message: &str) -> Option<(String, String, String)> {
-    let payload = message.strip_suffix('\n')?;
-    let parts: Vec<&str> = payload.split('\0').collect();
-    if parts.len() != 3 {
-        return None;
+fn validate_request(req: &JobRequest) -> Result<(), String> {
+    if req.input.trim().is_empty() {
+        return Err("input archive path is required and must not be empty".into());
     }
-    Some((
-        parts[0].to_string(),
-        parts[1].to_string(),
-        parts[2].to_string(),
-    ))
+    if req.output.trim().is_empty() {
+        return Err("output directory is required and must not be empty".into());
+    }
+    Ok(())
 }
 
 fn get_encoding() -> &'static Encoding {
@@ -81,8 +122,53 @@ fn get_encoding() -> &'static Encoding {
     }
 }
 
-// ref. https://qiita.com/takavfx/items/4743ceaf9fccc87eac52
-// ref. https://www.reddit.com/r/rust/comments/16egg88/create_a_tauri_app_that_is_both_a_gui_and_a_cli/
+fn forward_and_report(
+    mut conn: Stream,
+    matches: &tauri::api::cli::Matches,
+    main_window: Option<tauri::Window>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let req = matches_to_request(matches)
+        .ok_or_else(|| anyhow!("missing required arguments (input, output)"))?;
+    let json = serde_json::to_string(&req).unwrap();
+    conn.write_all(format!("{}\n", json).as_bytes())?;
+    let mut buf = String::new();
+    std::io::BufReader::new(&mut conn).read_line(&mut buf)?;
+    let (result, message) = match parse_response(&buf) {
+        Some(resp) if resp.accepted => (
+            Ok(()),
+            format!("Extraction queued as job #{}", resp.id.unwrap_or(0)),
+        ),
+        Some(resp) => {
+            let msg = resp.error.unwrap_or_else(|| "request rejected".into());
+            (Err(anyhow!("{}", msg).into()), msg)
+        }
+        None => (
+            Err(anyhow!("malformed response from server").into()),
+            "malformed response from server".to_string(),
+        ),
+    };
+
+    let mw = main_window;
+    #[cfg(debug_assertions)]
+    {
+        println!("{}", message);
+        if let Some(w) = mw {
+            let _ = w.close();
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let msg = message;
+        tauri::async_runtime::spawn(async move {
+            message(mw.as_ref(), "q7z", &msg);
+            if let Some(w) = mw {
+                let _ = w.close();
+            }
+        });
+    }
+
+    result
+}
 
 fn main() {
     tauri::Builder::default()
@@ -90,89 +176,89 @@ fn main() {
         .invoke_handler(tauri::generate_handler![current_job])
         .setup(|app| {
             let matches = app.get_cli_matches();
-            let name = get_socket_name();
-            match Stream::connect(name) {
-                Ok(mut conn) => {
-                    // server exists, forward this invocation's arguments to it
-                    match matches {
-                        Ok(matches) => {
-                            let ipc_message = match matches_to_message(matches) {
-                                Some(m) => m,
-                                None => {
-                                    return Err(anyhow!(
-                                        "missing required arguments (input, output)"
-                                    )
-                                    .into());
-                                }
-                            };
-                            if let Err(e) = conn.write_all(ipc_message.as_bytes()) {
-                                eprintln!(
-                                    "q7z: failed to forward arguments to existing process: {e}"
-                                );
+            let main_window = app.get_window("main");
+
+            match Stream::connect(get_socket_name()) {
+                Ok(conn) => match matches {
+                    Ok(ref m) => {
+                        forward_and_report(conn, m, main_window)?;
+                        Ok(())
+                    }
+                    Err(_) => Err(anyhow!(
+                        "no arguments specified but there is another process, nothing to do"
+                    )
+                    .into()),
+                },
+                Err(_) => match create_listener() {
+                    Ok(listener) => {
+                        app.get_window("main").unwrap().show().unwrap();
+                        let app_handle = app.handle();
+                        let (tx, mut rx) = mpsc::channel::<Job>(16);
+                        let worker_handle = app_handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            while let Some(job) = rx.recv().await {
+                                run_7z(&worker_handle, job).await;
                             }
-                            // TODO: if failed, restart server
-                            let notice_message = "pass arguments to an existing process";
-                            #[cfg(debug_assertions)]
-                            println!("{}", notice_message);
-                            let main_window = app.get_window("main");
-                            tauri::async_runtime::spawn(async move {
-                                #[cfg(not(debug_assertions))]
-                                message(main_window.as_ref(), "q7z", notice_message);
-                                main_window.unwrap().close().unwrap()
-                            });
-                            Ok(())
+                        });
+                        let listener_tx = tx.clone();
+                        let listener_handle = app_handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            listen_for_ipc(listener, listener_tx, listener_handle).await;
+                        });
+                        if let Ok(ref m) = matches {
+                            if let Some(req) = matches_to_request(m) {
+                                match validate_request(&req) {
+                                    Ok(()) => {
+                                        let id = app_handle
+                                            .state::<AppState>()
+                                            .next_job_id
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        let job = Job {
+                                            id,
+                                            input: req.input,
+                                            output: req.output,
+                                            filter: req.filter,
+                                        };
+                                        if let Err(e) = tx.try_send(job) {
+                                            eprintln!(
+                                                "q7z: failed to enqueue first invocation: {e}"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => eprintln!("q7z: {e}"),
+                                }
+                            }
                         }
+                        Ok(())
+                    }
+                    Err(bind_err) => match Stream::connect(get_socket_name()) {
+                        Ok(conn) => match matches {
+                            Ok(ref m) => {
+                                forward_and_report(conn, m, main_window)?;
+                                Ok(())
+                            }
+                            Err(_) => Err(anyhow!(
+                                "no arguments specified but there is another process, nothing to do"
+                            )
+                            .into()),
+                        },
                         Err(_) => Err(anyhow!(
-                            "no argments specified but there is another process, nothing to do"
+                            "failed to bind listener and no existing process: {bind_err}"
                         )
                         .into()),
-                    }
-                }
-                Err(_) => {
-                    // server does not exist, become the persistent worker
-                    app.get_window("main").unwrap().show().unwrap(); // show main window
-                    let app_handle = app.handle();
-                    let (tx, mut rx) = mpsc::channel::<(String, String, String)>(16);
-                    let worker_handle = app_handle.clone();
-                    tauri::async_runtime::spawn(async move {
-                        // Single serial worker: one job at a time, in arrival order.
-                        while let Some((input, output, filter)) = rx.recv().await {
-                            run_7z(&worker_handle, input, output, filter).await;
-                        }
-                    });
-                    let listener_tx = tx.clone();
-                    tauri::async_runtime::spawn(async move {
-                        listen_for_ipc(listener_tx).await;
-                    });
-                    // The first invocation enqueues its own request through the same
-                    // channel, so first and later invocations follow one path.
-                    if let Ok(matches) = matches {
-                        if let Some(ipc_message) = matches_to_message(matches) {
-                            if let Some(job) = parse_message(&ipc_message) {
-                                if let Err(e) = tx.try_send(job) {
-                                    eprintln!("q7z: failed to enqueue first invocation: {e}");
-                                }
-                            }
-                        }
-                    }
-                    Ok(())
-                }
+                    },
+                },
             }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 
-async fn listen_for_ipc(jobs_tx: mpsc::Sender<(String, String, String)>) {
-    let name = get_socket_name();
-    let opts = ListenerOptions::new().name(name);
-    let listener = match opts.create_tokio() {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("q7z: failed to bind IPC listener: {e}");
-            return;
-        }
-    };
+async fn listen_for_ipc(
+    listener: Listener,
+    jobs_tx: mpsc::Sender<Job>,
+    app_handle: tauri::AppHandle,
+) {
     loop {
         let stream = match listener.accept().await {
             Ok(s) => s,
@@ -181,27 +267,79 @@ async fn listen_for_ipc(jobs_tx: mpsc::Sender<(String, String, String)>) {
                 continue;
             }
         };
-        let mut reader = BufReader::new(stream);
-        let mut buffer = String::with_capacity(512);
-        if let Err(e) = reader.read_line(&mut buffer).await {
-            eprintln!("q7z: IPC read failed: {e}");
-            continue;
-        }
-        let Some(job) = parse_message(&buffer) else {
-            eprintln!("q7z: malformed IPC message ignored");
-            continue;
-        };
-        println!(
-            "Recieved: input:{} output:{} filter:{}",
-            job.0, job.1, job.2
-        );
-        if let Err(e) = jobs_tx.send(job).await {
-            eprintln!("q7z: failed to enqueue job (worker stopped?): {e}");
-        }
+        let tx = jobs_tx.clone();
+        let handle = app_handle.clone();
+        tauri::async_runtime::spawn(async move {
+            handle_connection(stream, tx, handle).await;
+        });
     }
 }
 
-async fn run_7z(app_handle: &tauri::AppHandle, input: String, output: String, filter: String) {
+async fn handle_connection(
+    mut stream: TokioStream,
+    jobs_tx: mpsc::Sender<Job>,
+    app_handle: tauri::AppHandle,
+) {
+    let mut buf = String::new();
+    {
+        let mut reader = BufReader::new(&mut stream);
+        match reader.read_line(&mut buf).await {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("q7z: IPC read failed: {e}");
+                return;
+            }
+        }
+    }
+    let resp = match parse_request(&buf) {
+        None => JobResponse {
+            accepted: false,
+            id: None,
+            error: Some("malformed request".into()),
+        },
+        Some(req) => match validate_request(&req) {
+            Err(e) => JobResponse {
+                accepted: false,
+                id: None,
+                error: Some(e),
+            },
+            Ok(()) => {
+                let id = app_handle
+                    .state::<AppState>()
+                    .next_job_id
+                    .fetch_add(1, Ordering::Relaxed);
+                let job = Job {
+                    id,
+                    input: req.input,
+                    output: req.output,
+                    filter: req.filter,
+                };
+                match jobs_tx.send(job).await {
+                    Err(e) => JobResponse {
+                        accepted: false,
+                        id: None,
+                        error: Some(format!("queue closed: {e}")),
+                    },
+                    Ok(()) => JobResponse {
+                        accepted: true,
+                        id: Some(id),
+                        error: None,
+                    },
+                }
+            }
+        },
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    if let Err(e) = stream.write_all(format!("{}\n", json).as_bytes()).await {
+        eprintln!("q7z: failed to send ack: {e}");
+    }
+}
+
+async fn run_7z(app_handle: &tauri::AppHandle, job: Job) {
+    let input = job.input;
+    let output = job.output;
+    let filter = job.filter;
     if let Some(state) = app_handle.try_state::<AppState>() {
         *state.current_job.lock().unwrap() = Some((input.clone(), output.clone()));
     }
@@ -211,8 +349,8 @@ async fn run_7z(app_handle: &tauri::AppHandle, input: String, output: String, fi
     cmd.raw_arg("x")
         .raw_arg(&input)
         .raw_arg(format!("-o{}", output))
-        .raw_arg("-aou") // auto rename extracting file
-        .raw_arg("-bsp1"); // set progress information to stdout
+        .raw_arg("-aou")
+        .raw_arg("-bsp1");
     if !filter.is_empty() {
         cmd.raw_arg(&filter);
     }
@@ -252,16 +390,147 @@ async fn run_7z(app_handle: &tauri::AppHandle, input: String, output: String, fi
                     eprintln!("q7z: failed to emit percent event: {e}");
                 }
             }
-            // TODO: Append log part
-            // TODO: Show processing file
             println!("line:{} [{}] {}", line.len(), line, linefeed);
             buf = vec![];
         }
     }
 
-    // Wait for process completion so completion is actually checked. Full
-    // exit-status-based success/failure handling is T004.
     if let Err(e) = cmd.wait().await {
         eprintln!("q7z: failed to await 7z.exe exit: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_request_valid() {
+        let line = r#"{"input":"a.7z","output":"out","filter":""}"#;
+        let req = parse_request(line).unwrap();
+        assert_eq!(req.input, "a.7z");
+        assert_eq!(req.output, "out");
+        assert_eq!(req.filter, "");
+    }
+
+    #[test]
+    fn parse_request_default_filter() {
+        let line = r#"{"input":"a.7z","output":"out"}"#;
+        let req = parse_request(line).unwrap();
+        assert_eq!(req.filter, "");
+    }
+
+    #[test]
+    fn parse_request_with_filter() {
+        let line = r#"{"input":"a.7z","output":"out","filter":"*.txt"}"#;
+        let req = parse_request(line).unwrap();
+        assert_eq!(req.filter, "*.txt");
+    }
+
+    #[test]
+    fn parse_request_malformed_json() {
+        assert!(parse_request("not json").is_none());
+        assert!(parse_request("").is_none());
+    }
+
+    #[test]
+    fn parse_response_accept() {
+        let line = r#"{"accepted":true,"id":5}"#;
+        let resp = parse_response(line).unwrap();
+        assert!(resp.accepted);
+        assert_eq!(resp.id, Some(5));
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn parse_response_reject() {
+        let line = r#"{"accepted":false,"error":"bad input"}"#;
+        let resp = parse_response(line).unwrap();
+        assert!(!resp.accepted);
+        assert_eq!(resp.error, Some("bad input".into()));
+    }
+
+    #[test]
+    fn validate_accepts_nonempty() {
+        let req = JobRequest {
+            input: "a.7z".into(),
+            output: "out".into(),
+            filter: "".into(),
+        };
+        assert!(validate_request(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_input() {
+        let req = JobRequest {
+            input: "   ".into(),
+            output: "out".into(),
+            filter: "".into(),
+        };
+        assert!(validate_request(&req).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_output() {
+        let req = JobRequest {
+            input: "a.7z".into(),
+            output: "".into(),
+            filter: "".into(),
+        };
+        assert!(validate_request(&req).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_with_filter() {
+        let req = JobRequest {
+            input: "a.7z".into(),
+            output: "out".into(),
+            filter: "*.txt".into(),
+        };
+        assert!(validate_request(&req).is_ok());
+    }
+
+    #[test]
+    fn response_serialize_roundtrip() {
+        let resp = JobResponse {
+            accepted: true,
+            id: Some(42),
+            error: None,
+        };
+        let s = serde_json::to_string(&resp).unwrap();
+        let parsed = parse_response(&s).unwrap();
+        assert!(parsed.accepted);
+        assert_eq!(parsed.id, Some(42));
+    }
+
+    #[test]
+    fn response_reject_roundtrip() {
+        let resp = JobResponse {
+            accepted: false,
+            id: None,
+            error: Some("malformed".into()),
+        };
+        let s = serde_json::to_string(&resp).unwrap();
+        let parsed = parse_response(&s).unwrap();
+        assert!(!parsed.accepted);
+        assert_eq!(parsed.error, Some("malformed".into()));
+    }
+
+    #[test]
+    fn queue_preserves_arrival_order() {
+        let (tx, mut rx) = mpsc::channel::<Job>(16);
+        for i in 0..5 {
+            let job = Job {
+                id: i,
+                input: format!("a{i}.7z"),
+                output: "out".into(),
+                filter: "".into(),
+            };
+            tx.try_send(job).unwrap();
+        }
+        for expected in 0..5 {
+            let job = rx.try_recv().unwrap();
+            assert_eq!(job.id, expected);
+        }
     }
 }

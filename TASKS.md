@@ -13,12 +13,14 @@ Develop a dependable Windows desktop application that accepts 7-Zip extraction r
 
 ## Current status
 
-The repository is an early prototype. A Tauri backend hosts a single serial extraction worker fed by an mpsc channel; a named-local-socket listener enqueues forwarded jobs, and the first invocation enqueues its own request through the same channel. `7z.exe` runs serially, percentage output is parsed and emitted to a minimal TypeScript UI, and a `job` event plus a `current_job` command identify the active request. Panic paths in the listener and process runner were replaced with recoverable diagnostics, and process completion is awaited. The optional `filter` CLI arg is forwarded only when actually supplied (Tauri represents an unprovided optional arg as `Value::Bool(false)` with `occurrences == 0`; the prior code emitted the literal string `"false"` as a 7z filter, matching no files). On completion, "Everything is Ok" forces the `percent` event to `100` so the progress bar fills. Job state/log streaming, full validation, exit-status-based success/failure (currently inferred from `Everything is Ok`, not the exit code), capturing 7z's stderr, structured IPC framing/acknowledgements, automated tests, and Windows packaging remain pending. As of 2026-08-02, `npm run build`, `cargo fmt --check`, `cargo check --locked`, and `cargo test --locked` (0 tests configured) all pass on Windows.
+The repository is an early prototype. A Tauri backend hosts a single serial extraction worker fed by an mpsc channel; a named-local-socket listener accepts forwarded jobs, and the first invocation enqueues its own request through the same channel. The IPC wire format is now line-delimited JSON (versionable via serde structs) with acknowledgement responses, replacing the prior NUL-delimited fire-and-forget protocol. Connection accepted by the worker are validated and either enqueued (positive ack with job id) or rejected (negative ack with an error string); the forwarder reads the ack and reports it. The listener is bound synchronously in `setup` via `tauri::async_runtime::block_on` to narrow the listener-start race, and on bind failure the process retries connect (another process must have just bound). `7z.exe` runs serially, percentage output is parsed and emitted to the TypeScript UI, and a `job` event plus a `current_job` command identify the active request. Process completion is awaited; "Everything is Ok" forces `percent: 100`. Out-of-scope for T003 but still pending in later tasks: full argument/IPC/path validation, exit-status-based success/failure (currently inferred from `Everything is Ok`), capturing 7z's stderr for the UI, job-state UI, automated tests for non-IPC logic, and Windows packaging.
+
+As of 2026-08-02, `npm run build`, `cargo fmt --check`, `cargo check --locked` (no warnings), and `cargo test --locked` (13 tests) all pass on Windows.
 
 ## Active task
 
-- Task: `T003` (reliable job and IPC semantics) — next: design structured job identity/states, version or replace the NUL-delimited IPC format with framing and acknowledgements, handle malformed messages and the remaining listener-start race (first invocation starts before any worker exists; forwarded jobs rely on a connection succeeding), and add automated tests for parsing and queue ordering.
-- Recently completed: `T002` restored the build baseline; `T001` prototype is complete — implemented and verified end-to-end on Windows including queueing, serial execution, first-invocation enqueue, worker survival after a failing archive, percentage emission, forcing 100% on completion, and visual UI confirmation (current request displayed in both first-invocation and forwarded cases).
+- Task: `T004` (robust 7-Zip execution) — next: derive success/failure from `7z.exe`'s process exit status rather than from `Everything is Ok` text matching, capture 7z stderr for the UI, ensure one failed job never terminates the worker, validate finite progress values 0–100, and verify Windows paths containing spaces and non-ASCII characters as single 7z arguments (currently constructed via `raw_arg`, which is correct but unverified for non-ASCII).
+- Recently completed: `T002` restored the build baseline; `T001` prototype is complete; `T003` implemented and programmatically verified the structured IPC contract, acknowledgements, listener-start race narrowing, single validation/enqueue path, and automated parsing/validation/queue-ordering tests.
 
 ## Tasks
 
@@ -92,7 +94,7 @@ Use stable IDs. Append newly accepted work using the next unused ID. Never reuse
 
 ### T003 — Define reliable job and IPC semantics
 
-- Status: pending
+- Status: completed
 - Objective: Represent every extraction request as a validated job that can be accepted, queued, rejected, and tracked predictably.
 - Scope:
   - Define job identity, request fields, states, and ordering.
@@ -104,13 +106,24 @@ Use stable IDs. Append newly accepted work using the next unused ID. Never reuse
   - Malformed requests cannot crash or desynchronize the listener.
   - Automated tests cover message parsing and queue ordering.
 - Implemented:
-  - None beyond the prototype recorded in `T001`.
-- Verification:
-  - Not run.
+  - Job model: `JobRequest { input, output, filter }` (serde), `Job { id, input, output, filter }` (internal), `JobResponse { accepted, id?, error? }` (serde). IDs assigned via an `AtomicU64` in `AppState`.
+  - IPC protocol v1: line-delimited JSON `{"input":..,"output":..,"filter":..}\n` for requests and `{"accepted":..,"id":..,"error":..}`\n for responses. No size on disk for the version; forward-compatible via serde (optional fields default to empty); malformed JSON parse returns `None` and the worker replies with a negative ack instead of crashing.
+  - Acknowledgements: `forward_and_report` writes the request line synchronously through the generic `Stream` (sync `std::io::Write`), reads the response line synchronously (`std::io::BufRead::read_line`), parses it, prints/discusses the result, spawns an async task to dismiss the window (release shows a blocking dialog via `tauri::api::dialog::blocking::message`).
+  - Listener: accepts connections via the tokio `Listener`, then spawns a per-connection `handle_connection` task that reads the request async (`AsyncBufReadExt::read_line`), validates, enqueues into the shared mpsc channel, and writes the ack back async (`AsyncWriteExt::write_all`). EOF (`Ok(0)`) on the first read returns silently so a forwarder that exited before writing any bytes is not treated as a malformed request.
+  - Listener-start race: the listener is bound synchronously in `setup` via `tauri::async_runtime::block_on(async { ... create_tokio() })` (which runs on the singleton Tokio runtime that Tauri initializes before calling setup). On bind failure the process immediately retries `Stream::connect` (another process must have just bound) and, if that also fails, surfaces a single combined error instead of spawning a second worker or hanging.
+  - Single validation/enqueue path: `validate_request` (rejects empty input or output after trim) and the `AtomicU64` ID assignment are shared between the first-invocation enqueue (`tx.try_send`) and the forwarded-listener enqueue (`jobs_tx.send().await`). The forwarder and the worker both use `matches_to_request` to build the `JobRequest` from Tauri's `Matches`.
+- Verification (2026-08-02, Windows, `npm run tauri build -- --debug` binary; `7-Zip 26.02 x64`):
+  - `cargo test --locked`: 13 tests pass — `parse_request_valid`, `parse_request_default_filter`, `parse_request_with_filter`, `parse_request_malformed_json`, `parse_response_accept`, `parse_response_reject`, `validate_accepts_nonempty`, `validate_rejects_empty_input`, `validate_rejects_empty_output`, `validate_accepts_with_filter`, `response_serialize_roundtrip`, `response_reject_roundtrip`, `queue_preserves_arrival_order`.
+  - `cargo fmt --check`, `cargo check --locked` (no warnings), `npx tsc --noEmit`, `npm run build`: all pass.
+  - End-to-end: launching the worker with the first invocation (`archive.7z -> outA`) and then three more invocations in sequence (valid `outB`, corrupt `bad.7z -> outC_bad`, valid `outD`) produced `outA=2`, `outB=2`, `outD=2` (all `Everything is Ok` / `Files: 2`), the corrupt archive surfaced `ERROR: Cannot open the file as [7z] archive / ERRORS: Is not archive` on the worker's stderr, the worker survived and ran the subsequent valid job, and the listener logged no spurious "failed to send ack" after the EOF fix.
+  - EOF connection from a forwarder that exited before writing: the listener returns silently (no crash, no spurious ack).
+  - Race narrowing: `create_listener` called via `block_on` from `setup` ensures the socket is bound before `setup` returns; a second invocation reaching the same code will fail to bind, retry connect, and forward to the first instead of spawning a second listener/worker (verified by code path, not by a deliberate two-process race scenario).
+- Verification remaining (manual):
+  - Release-mode forwarder dialog: the `#[cfg(not(debug_assertions))]` branch spawns `message(...)` to display a dialog and close the window. The debug binary path was exercised; release-mode behavior was not programmatically verified on Windows (needs a manual `npm run tauri build`).
 - Remaining:
-  - Design, implement, and test the job model and IPC contract.
+  - None intrinsic to T003's stated scope. Exit-status-based success/failure, 7z stderr capture, full path/argument validation, and the forwarder's `Builder::run().expect()` panic on bad CLI args belong to later tasks (`T004`, `T006`).
 - Notes:
-  - Preserve CLI compatibility or document and approve a migration.
+  - The CLI was unchanged — `q7z.exe <input> <output> [filter]` still works. Only the internal IPC wire format changed (NUL-delimited → line-delimited JSON); this is an internal protocol between two q7z instances and does not affect external users.
 
 ### T004 — Make 7-Zip execution robust
 
