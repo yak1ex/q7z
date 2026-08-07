@@ -3,7 +3,7 @@
 use std::io::{BufRead, Write};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
 use interprocess::local_socket::tokio::{Listener, Stream as TokioStream};
@@ -36,6 +36,14 @@ struct JobResponse {
     accepted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ResultEvent {
+    ok: bool,
+    exit_code: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -113,6 +121,15 @@ fn validate_request(req: &JobRequest) -> Result<(), String> {
         return Err("output directory is required and must not be empty".into());
     }
     Ok(())
+}
+
+fn parse_percent(raw: &str) -> Option<u8> {
+    let n: u32 = raw.parse().ok()?;
+    if n <= 100 {
+        Some(n as u8)
+    } else {
+        None
+    }
 }
 
 fn get_encoding() -> &'static Encoding {
@@ -346,28 +363,63 @@ async fn run_7z(app_handle: &tauri::AppHandle, job: Job) {
     let _ = app_handle.emit_all("job", (&input, &output));
 
     let mut cmd = Command::new("7z.exe");
-    cmd.raw_arg("x")
-        .raw_arg(&input)
-        .raw_arg(format!("-o{}", output))
-        .raw_arg("-aou")
-        .raw_arg("-bsp1");
+    cmd.arg("x")
+        .arg(&input)
+        .arg(format!("-o{}", output))
+        .arg("-aou")
+        .arg("-bsp1");
     if !filter.is_empty() {
-        cmd.raw_arg(&filter);
+        cmd.arg(&filter);
     }
-    let mut cmd = match cmd.stdout(Stdio::piped()).spawn() {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut cmd = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("q7z: failed to start 7z.exe (is it on PATH?): {e}");
+            let err = format!("failed to start 7z.exe (is it on PATH?): {e}");
+            eprintln!("q7z: {err}");
+            let _ = app_handle.emit_all(
+                "result",
+                ResultEvent {
+                    ok: false,
+                    exit_code: -1,
+                    error: Some(err),
+                },
+            );
             return;
         }
     };
 
-    if let Some(ref mut stdout) = cmd.stdout {
-        let converter = get_encoding();
+    let converter = get_encoding();
+    let stderr_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let stderr_capture = Arc::clone(&stderr_lines);
+    let stderr_handle = app_handle.clone();
+    let stderr_task = cmd.stderr.take().map(|stderr| {
+        tauri::async_runtime::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                let (raw, _, _) = converter.decode(&buf);
+                let line = raw.trim_end_matches(|c| c == '\r' || c == '\n');
+                if !line.is_empty() {
+                    let _ = stderr_handle.emit_all("log", line);
+                    stderr_capture.lock().unwrap().push(line.to_string());
+                }
+            }
+        })
+    });
+
+    if let Some(stdout) = cmd.stdout.take() {
         let mut reader = tokio::io::BufReader::new(stdout);
         let re = Regex::new(r"^\s*(\d+)%").unwrap();
-        let mut buf: Vec<u8> = vec![];
+        let mut buf: Vec<u8> = Vec::new();
         loop {
+            buf.clear();
             match reader.read_until(b'\r', &mut buf).await {
                 Ok(0) => break,
                 Ok(_) => {}
@@ -380,24 +432,59 @@ async fn run_7z(app_handle: &tauri::AppHandle, job: Job) {
             let linefeed = raw_line.chars().nth(0) == Some('\n');
             let line = raw_line.trim_start_matches('\n').trim_end_matches('\r');
             if let Some(caps) = re.captures(line) {
-                let percent = caps.get(1).unwrap().as_str();
-                if let Err(e) = app_handle.emit_all("percent", percent) {
-                    eprintln!("q7z: failed to emit percent event: {e}");
+                let raw_pct = caps.get(1).unwrap().as_str();
+                if let Some(pct) = parse_percent(raw_pct) {
+                    let _ = app_handle.emit_all("percent", pct.to_string());
                 }
+            } else if !line.is_empty() {
+                let _ = app_handle.emit_all("log", line);
             }
             if line.contains("Everything is Ok") {
-                if let Err(e) = app_handle.emit_all("percent", "100") {
-                    eprintln!("q7z: failed to emit percent event: {e}");
-                }
+                let _ = app_handle.emit_all("percent", "100");
             }
             println!("line:{} [{}] {}", line.len(), line, linefeed);
-            buf = vec![];
         }
     }
 
-    if let Err(e) = cmd.wait().await {
-        eprintln!("q7z: failed to await 7z.exe exit: {e}");
+    let exit_status = cmd.wait().await;
+    if let Some(task) = stderr_task {
+        let _ = task.await;
     }
+
+    let result = match exit_status {
+        Ok(status) => {
+            if status.success() {
+                let _ = app_handle.emit_all("percent", "100");
+                ResultEvent {
+                    ok: true,
+                    exit_code: status.code().unwrap_or(0),
+                    error: None,
+                }
+            } else {
+                let code = status.code().unwrap_or(-1);
+                let stderr_tail = stderr_lines.lock().unwrap().last().cloned();
+                let err = stderr_tail
+                    .map(|t| format!("7z.exe exited with code {code}: {t}"))
+                    .unwrap_or_else(|| format!("7z.exe exited with code {code}"));
+                eprintln!("q7z: {err}");
+                ResultEvent {
+                    ok: false,
+                    exit_code: code,
+                    error: Some(err),
+                }
+            }
+        }
+        Err(e) => {
+            let err = format!("failed to await 7z.exe exit: {e}");
+            eprintln!("q7z: {err}");
+            ResultEvent {
+                ok: false,
+                exit_code: -1,
+                error: Some(err),
+            }
+        }
+    };
+    let _ = app_handle.emit_all("result", &result);
 }
 
 #[cfg(test)]
@@ -532,5 +619,26 @@ mod tests {
             let job = rx.try_recv().unwrap();
             assert_eq!(job.id, expected);
         }
+    }
+
+    #[test]
+    fn parse_percent_valid() {
+        assert_eq!(parse_percent("0"), Some(0));
+        assert_eq!(parse_percent("76"), Some(76));
+        assert_eq!(parse_percent("100"), Some(100));
+    }
+
+    #[test]
+    fn parse_percent_out_of_range() {
+        assert_eq!(parse_percent("101"), None);
+        assert_eq!(parse_percent("150"), None);
+        assert_eq!(parse_percent("4294967296"), None);
+    }
+
+    #[test]
+    fn parse_percent_non_numeric() {
+        assert_eq!(parse_percent(""), None);
+        assert_eq!(parse_percent("abc"), None);
+        assert_eq!(parse_percent("12a"), None);
     }
 }

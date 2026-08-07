@@ -5,7 +5,7 @@ export function setupProgress(element: HTMLDivElement) {
   element.appendChild(progress_bar)
 
   const setProgress = (new_percent: number) => {
-    if(new_percent < 0 && new_percent > 100) {
+    if(!Number.isFinite(new_percent) || new_percent < 0 || new_percent > 100) {
       return
     }
     percent = new_percent

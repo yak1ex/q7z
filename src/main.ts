@@ -25,12 +25,39 @@ void (async () => {
   }
   const onPercent = (event: { payload: unknown }) => {
     if(typeof(event.payload) === 'string') {
-      setProgress(parseInt(event.payload))
+      const n = parseInt(event.payload)
+      if(Number.isFinite(n)) setProgress(n)
+    }
+  }
+  const onLog = (event: { payload: unknown }) => {
+    if(typeof(event.payload) === 'string') {
+      const log_el = document.querySelector<HTMLTextAreaElement>('#log')
+      if(log_el) {
+        log_el.value += event.payload + '\n'
+        log_el.scrollTop = log_el.scrollHeight
+      }
+    }
+  }
+  const onResult = (event: { payload: unknown }) => {
+    const p = event.payload
+    if(p && typeof(p) === 'object' && 'ok' in p && 'exit_code' in p) {
+      const ok = (p as { ok: boolean }).ok
+      const code = (p as { exit_code: number }).exit_code
+      const err = (p as { error?: string }).error
+      const log_el = document.querySelector<HTMLTextAreaElement>('#log')
+      if(log_el) {
+        const line = ok ? `[ok] exit ${code}` : `[error] exit ${code}${err ? ': ' + err : ''}`
+        log_el.value += line + '\n'
+        log_el.scrollTop = log_el.scrollHeight
+      }
+      if(!ok) setProgress(0)
     }
   }
   await Promise.all([
     listen('job', onJob),
     listen('percent', onPercent),
+    listen('log', onLog),
+    listen('result', onResult),
   ])
   const job = await invoke<[string, string] | null>('current_job')
   if(Array.isArray(job) && job.length === 2

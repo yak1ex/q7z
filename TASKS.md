@@ -13,14 +13,16 @@ Develop a dependable Windows desktop application that accepts 7-Zip extraction r
 
 ## Current status
 
-The repository is an early prototype. A Tauri backend hosts a single serial extraction worker fed by an mpsc channel; a named-local-socket listener accepts forwarded jobs, and the first invocation enqueues its own request through the same channel. The IPC wire format is now line-delimited JSON (versionable via serde structs) with acknowledgement responses, replacing the prior NUL-delimited fire-and-forget protocol. Connection accepted by the worker are validated and either enqueued (positive ack with job id) or rejected (negative ack with an error string); the forwarder reads the ack and reports it. The listener is bound synchronously in `setup` via `tauri::async_runtime::block_on` to narrow the listener-start race, and on bind failure the process retries connect (another process must have just bound). `7z.exe` runs serially, percentage output is parsed and emitted to the TypeScript UI, and a `job` event plus a `current_job` command identify the active request. Process completion is awaited; "Everything is Ok" forces `percent: 100`. Out-of-scope for T003 but still pending in later tasks: full argument/IPC/path validation, exit-status-based success/failure (currently inferred from `Everything is Ok`), capturing 7z's stderr for the UI, job-state UI, automated tests for non-IPC logic, and Windows packaging.
+The repository is an early prototype. A Tauri backend hosts a single serial extraction worker fed by an mpsc channel; a named-local-socket listener accepts forwarded jobs, and the first invocation enqueues its own request through the same channel. The IPC wire format is line-delimited JSON with acknowledgement responses, replacing the prior NUL-delimited fire-and-forget protocol; the listener is bound synchronously in `setup` via `tauri::async_runtime::block_on` to narrow the listener-start race. `7z.exe` is invoked with `Command::arg` (not `raw_arg`) so Windows paths containing spaces and non-ASCII characters stay single arguments; stdout and stderr are piped and OEM-decoded; success/failure is derived from `ExitStatus` (with the stderr tail surfaced in the failure message); a `result` event reports completion and a `log` event streams 7z output to the UI. Percentage emission is range-validated to 0–100 server-side (`parse_percent`) and the frontend guard rejects `NaN`/out-of-range values (fixing the AGENTS.md §10 mutually-exclusive `&&` bug). One failed job no longer terminates the worker. `7z.exe` is kept external and resolved via `PATH`. The CLI is unchanged.
 
-As of 2026-08-02, `npm run build`, `cargo fmt --check`, `cargo check --locked` (no warnings), and `cargo test --locked` (13 tests) all pass on Windows.
+Still pending in later tasks: full job-state UI with pending/running/completed/failed badges and history retention (`T005`), automated regression tests for the full 7z execution path and manual Windows scenario documentation (`T006`), and Windows packaging/installation verification (`T007`).
+
+As of 2026-08-02, `npm run build`, `cargo fmt --check`, `cargo check --locked` (no warnings), and `cargo test --locked` (16 tests) all pass on Windows.
 
 ## Active task
 
-- Task: `T004` (robust 7-Zip execution) — next: derive success/failure from `7z.exe`'s process exit status rather than from `Everything is Ok` text matching, capture 7z stderr for the UI, ensure one failed job never terminates the worker, validate finite progress values 0–100, and verify Windows paths containing spaces and non-ASCII characters as single 7z arguments (currently constructed via `raw_arg`, which is correct but unverified for non-ASCII).
-- Recently completed: `T002` restored the build baseline; `T001` prototype is complete; `T003` implemented and programmatically verified the structured IPC contract, acknowledgements, listener-start race narrowing, single validation/enqueue path, and automated parsing/validation/queue-ordering tests.
+- Task: `T005` (present queue state, progress, logs, and errors) — next: surface pending/running/completed/failed job states in the UI (currently only the active job's `input -> output`, the progress bar, a flat `#log` textarea, and a final `[ok]`/`[error]` line are wired), keep event payloads and frontend state synchronized with the backend job model, and obtain manual UI verification.
+- Recently completed: `T002` restored the build baseline; `T001` prototype is complete; `T003` implemented and verified structured IPC + acknowledgements + race narrowing + tests; `T004` made 7-Zip execution robust (exit-status-based result, stderr capture, spaced/non-ASCII path fix via `arg`, finite 0–100 progress validation) and verified end-to-end on Windows.
 
 ## Tasks
 
@@ -127,7 +129,7 @@ Use stable IDs. Append newly accepted work using the next unused ID. Never reuse
 
 ### T004 — Make 7-Zip execution robust
 
-- Status: pending
+- Status: completed
 - Objective: Execute each accepted job safely and report a complete, accurate outcome.
 - Scope:
   - Construct arguments safely for Windows paths, optional filters, and non-ASCII text.
@@ -139,13 +141,28 @@ Use stable IDs. Append newly accepted work using the next unused ID. Never reuse
   - The queue proceeds after a failed job and emits an actionable error.
   - Progress remains within 0–100 and successful completion reaches 100%.
 - Implemented:
-  - None beyond the prototype process runner and parser recorded in `T001`.
-- Verification:
-  - Not run.
+  - Replaced `Command::raw_arg` with `Command::arg` for all `7z.exe` arguments (input, `-o<output>`, filter, and the fixed switches `x`/`-aou`/`-bsp1`). The prior `raw_arg` appends to the raw command line without quoting, so an output path containing a space (`-oC:\path\with space`) was split by Windows command-line parsing into `-oC:\path\with` + `space`, where `space` became a 7z filter matching no files → `Files: 0`. `arg` applies the standard Windows argument quoting so paths with spaces and non-ASCII characters remain single arguments.
+  - Piped both stdout and stderr from `7z.exe` (`Stdio::piped()` for each). Stderr is read concurrently in a spawned task: each OEM-decoded line is emitted as a `log` event to the frontend and captured into an `Arc<Mutex<Vec<String>>>` so the tail can be included in the failure result.
+  - Derive success/failure from `ExitStatus` after `cmd.wait().await`: `status.success()` (exit code 0) → emit `percent: 100` (safety net in addition to the existing "Everything is Ok" text trigger) and emit `result { ok: true, exit_code: 0, error: None }`; non-zero exit → emit `result { ok: false, exit_code: N, error: Some("7z.exe exited with code N: <last stderr line>") }`; wait failure → emit `result { ok: false, exit_code: -1, error: Some("failed to await 7z.exe exit: ...") }`. The stderr task's join handle is awaited before computing the result so the tail is available.
+  - Spawn-failure (e.g. `7z.exe` missing from `PATH`) emits `result { ok: false, exit_code: -1, error: Some("failed to start 7z.exe (is it on PATH?): ...") }` and returns, so the worker continues accepting subsequent jobs.
+  - Added `parse_percent(raw: &str) -> Option<u8>`: parses the regex-captured percentage string to `u32` and returns `Some(n as u8)` only when `n <= 100`; otherwise `None`. `run_7z` now emits `percent` only when `parse_percent` succeeds, so out-of-range or non-numeric captures cannot reach the UI.
+  - Fixed the frontend progress-range guard in `src/progress.ts`: the prior `if(new_percent < 0 && new_percent > 100)` was always false (mutually exclusive comparisons, as flagged in AGENTS.md §10); replaced with `if(!Number.isFinite(new_percent) || new_percent < 0 || new_percent > 100)`. Also guarded the `parseInt` path in `src/main.ts` with `Number.isFinite` so a non-numeric `percent` payload cannot produce a `NaN` width.
+  - Frontend `log` event listener appends each line to `#log` (the previously-empty textarea) and scrolls to the bottom; `result` listener appends a final `[ok] exit 0` or `[error] exit N: <msg>` line and resets the bar to 0 on failure. Full state/list UI remains `T005`.
+  - Tests: `parse_percent_valid` (0, 76, 100), `parse_percent_out_of_range` (101, 150, `u32::MAX+1`), `parse_percent_non_numeric` (empty, `abc`, `12a`).
+- Verification (2026-08-02, Windows, `npm run tauri build -- --debug` binary; `7-Zip 26.02 x64` on `PATH`):
+  - `cargo test --locked`: 16 tests pass (13 from `T003` + 3 new `parse_percent` cases).
+  - `cargo fmt --check`, `cargo check --locked` (no warnings), `npx tsc --noEmit`, `npm run build`: all pass.
+  - End-to-end (worker + three forwarded jobs):
+    - **Spaced output dir, ASCII archive** (`archive.7z -> "out A spaced"`): `Files: 2`, `Everything is Ok`, extracted `file two.txt` and `hello.txt`. (Failed before the `raw_arg`→`arg` fix with `Files: 0`.)
+    - **Spaced + non-ASCII output dir, non-ASCII archive** (`uni_archive.7z` containing `has space.txt` and `日本.txt` → `"out uni 日本"`): `Files: 2`, `Everything is Ok`, both files extracted with names preserved. Confirms `arg` keeps paths with spaces and non-ASCII characters as single arguments on Windows.
+    - **Corrupt archive** (`bad.7z -> "out C bad"`): `Files: 0`, output dir empty, worker's stderr carried the structured `q7z: 7z.exe exited with code 2: Is not archive` (exit status 2 + captured stderr tail), and the worker did not inherit 7z's raw stderr anymore.
+    - **Valid job after failure** (`archive.7z -> "out D survive"`): `Files: 2`, `Everything is Ok`, extracted both files — the worker survived the prior failure and proceeded in arrival order.
+- Verification remaining (manual):
+  - Visual UI confirmation that `#log` displays streamed 7z output and the final `[ok]`/`[error]` line during a real extraction, and that the progress bar still advances and reaches full on success and resets to 0 on failure. The plumbing is in place; the visible behavior was not manually confirmed this cycle.
 - Remaining:
-  - Implement process lifecycle handling, tests, and Windows integration verification.
+  - None intrinsic to `T004`'s stated scope. Job-state UI (pending/running/completed/failed badges, history retention, transition timing) is `T005`; automated regression tests for the full 7z execution path are `T006`.
 - Notes:
-  - Keep `7z.exe` external and resolved through `PATH`.
+  - `7z.exe` remains external and resolved through `PATH` (decision `D002`). The `arg` change is the smallest correct fix for the spaced-path bug; `raw_arg` was the wrong primitive for any path-containing argument on Windows because it skips the standard quoting that `CreateProcessW` consumers expect.
 
 ### T005 — Present queue state, progress, logs, and errors
 
